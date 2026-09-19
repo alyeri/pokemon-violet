@@ -1,0 +1,345 @@
+diff --git a/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/ManagedSocket.cs b/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/ManagedSocket.cs
+index ee3ebba..7254f59 100644
+--- a/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/ManagedSocket.cs
++++ b/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/ManagedSocket.cs
+@@ -356,6 +356,8 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+         }
+
+         private bool _hasEmittedBlockingWarning;
++        private bool _tlsClientHelloLogged;
++        private bool _tlsFirstReceiveLogged;
+
+         public LinuxError Receive(out int receiveSize, Span<byte> buffer, BsdSocketFlags flags)
+         {
+@@ -379,6 +381,8 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+
+                 receiveSize = Socket.Receive(buffer, ConvertBsdSocketFlags(flags));
+
++                LogFirstTlsReceive(buffer[..Math.Max(0, receiveSize)], "Receive");
++
+                 result = LinuxError.SUCCESS;
+             }
+             catch (SocketException exception)
+@@ -462,6 +466,8 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+
+         public LinuxError Send(out int sendSize, ReadOnlySpan<byte> buffer, BsdSocketFlags flags)
+         {
++            LogClientHello(buffer, "Send");
++
+             // [DIAG] Log any TLS handshake record we're asked to send, so we can see whether the
+             // game's ClientHello actually flows through this Bsd send path (vs nn::ssl / another method).
+             if (buffer.Length > 5 && buffer[0] == 0x16)
+@@ -707,6 +713,45 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+             return buffers;
+         }
+
++        private static byte[] GatherPrefix(ArraySegment<byte>[] buffers, int length)
++        {
++            int available = 0;
++            foreach (ArraySegment<byte> buffer in buffers)
++            {
++                available += buffer.Count;
++                if (available >= length) break;
++            }
++
++            byte[] result = new byte[Math.Min(available, length)];
++            int copied = 0;
++            foreach (ArraySegment<byte> buffer in buffers)
++            {
++                int count = Math.Min(buffer.Count, result.Length - copied);
++                if (count <= 0) break;
++                buffer.AsSpan(0, count).CopyTo(result.AsSpan(copied));
++                copied += count;
++            }
++            return result;
++        }
++
++        private void LogClientHello(ReadOnlySpan<byte> data, string operation)
++        {
++            if (!_tlsClientHelloLogged && TlsSniInjector.TryDescribeClientHello(data, out string description))
++            {
++                _tlsClientHelloLogged = true;
++                Logger.Info?.Print(LogClass.ServiceBsd, $"[NPLN TLS] {operation} ClientHello {description} remote={RemoteEndPoint}");
++            }
++        }
++
++        private void LogFirstTlsReceive(ReadOnlySpan<byte> data, string operation)
++        {
++            if (!_tlsFirstReceiveLogged && data.Length > 0)
++            {
++                _tlsFirstReceiveLogged = true;
++                Logger.Info?.Print(LogClass.ServiceBsd, $"[NPLN TLS] {operation} first inbound {TlsSniInjector.DescribeServerFlight(data)} remote={RemoteEndPoint}");
++            }
++        }
++
+         private static void UpdateMessages(out int vlen, BsdMMsgHdr message, int transferedSize)
+         {
+             int bytesLeft = transferedSize;
+@@ -849,9 +894,11 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+                 SocketError socketError;
+                 int receiveSize;
+
++                ArraySegment<byte>[] receiveBuffers = ConvertMessagesToBuffer(message);
++
+                 if (Socket is DefaultSocket hostSocket)
+                 {
+-                    receiveSize = hostSocket.BaseSocket.Receive(ConvertMessagesToBuffer(message), ConvertBsdSocketFlags(flags), out socketError);
++                    receiveSize = hostSocket.BaseSocket.Receive(receiveBuffers, ConvertBsdSocketFlags(flags), out socketError);
+                 }
+                 else
+                 {
+@@ -859,11 +906,12 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+                     // LAN Play ou RyuLDN c est un socket virtuel, qui n a pas de reception
+                     // vectorisee — d ou le remplissage segment par segment au lieu du
+                     // transtypage, qui levait ici.
+-                    receiveSize = ReceiveSegments(ConvertMessagesToBuffer(message), ConvertBsdSocketFlags(flags), out socketError);
++                    receiveSize = ReceiveSegments(receiveBuffers, ConvertBsdSocketFlags(flags), out socketError);
+                 }
+
+                 if (receiveSize > 0)
+                 {
++                    LogFirstTlsReceive(GatherPrefix(receiveBuffers, receiveSize), "RecvMMsg");
+                     UpdateMessages(out vlen, message, receiveSize);
+                 }
+
+@@ -904,10 +952,7 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+             try
+             {
+                 ArraySegment<byte>[] mmsgBuf = ConvertMessagesToBuffer(message);
+-                if (mmsgBuf.Length > 0 && mmsgBuf[0].Count > 5 && mmsgBuf[0].Array[mmsgBuf[0].Offset] == 0x16)
+-                {
+-                    Logger.Info?.Print(LogClass.ServiceBsd, $"[DIAG] Bsd.SendMMsg TLS hs=0x{mmsgBuf[0].Array[mmsgBuf[0].Offset + 5]:x2} len={mmsgBuf[0].Count} remote={RemoteEndPoint}");
+-                }
++                LogClientHello(GatherPrefix(mmsgBuf, 65540), "SendMMsg");
+                 SocketError socketError;
+                 int sendSize;
+
+diff --git a/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/TlsSniInjector.cs b/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/TlsSniInjector.cs
+index 1a64f82..5f53ce7 100644
+--- a/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/TlsSniInjector.cs
++++ b/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/TlsSniInjector.cs
+@@ -1,4 +1,5 @@
+ using System;
++using System.Collections.Generic;
+ using System.Text;
+
+ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+@@ -11,44 +12,149 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+     // passthrough — exactly like a real Switch.
+     static class TlsSniInjector
+     {
+-        public static bool TryInject(ReadOnlySpan<byte> input, string hostName, out byte[] output)
++        public static bool TryDescribeClientHello(ReadOnlySpan<byte> input, out string description)
+         {
+-            output = null;
++            description = null;
+
+-            // TLS record header: content_type=0x16 (handshake), version(2), length(2).
+-            if (input.Length < 43 || input[0] != 0x16)
++            if (!TryGetExtensions(input, out int cipherSuiteCount, out int extStart, out int extEnd))
+             {
+                 return false;
+             }
+
+-            int recordLen = (input[3] << 8) | input[4];
+-            if (5 + recordLen > input.Length)
++            string sni = "absent";
++            string alpn = "absent";
++            string supportedVersions = "absent";
++            int extensionCount = 0;
++
++            for (int q = extStart; q + 4 <= extEnd; extensionCount++)
++            {
++                int type = ReadU16(input, q);
++                int length = ReadU16(input, q + 2);
++                int dataStart = q + 4;
++                int dataEnd = dataStart + length;
++                if (dataEnd > extEnd)
++                {
++                    return false;
++                }
++
++                if (type == 0 && length >= 5)
++                {
++                    int listLength = ReadU16(input, dataStart);
++                    int nameLength = ReadU16(input, dataStart + 3);
++                    if (listLength >= nameLength + 3 && dataStart + 5 + nameLength <= dataEnd)
++                    {
++                        sni = Encoding.ASCII.GetString(input.Slice(dataStart + 5, nameLength));
++                    }
++                }
++                else if (type == 16 && length >= 3)
++                {
++                    List<string> protocols = new();
++                    int cursor = dataStart + 2;
++                    while (cursor < dataEnd)
++                    {
++                        int protocolLength = input[cursor++];
++                        if (cursor + protocolLength > dataEnd)
++                        {
++                            return false;
++                        }
++                        protocols.Add(Encoding.ASCII.GetString(input.Slice(cursor, protocolLength)));
++                        cursor += protocolLength;
++                    }
++                    alpn = protocols.Count == 0 ? "empty" : string.Join(",", protocols);
++                }
++                else if (type == 43 && length >= 3)
++                {
++                    List<string> versions = new();
++                    int listLength = input[dataStart];
++                    int cursor = dataStart + 1;
++                    int listEnd = Math.Min(cursor + listLength, dataEnd);
++                    while (cursor + 2 <= listEnd)
++                    {
++                        versions.Add($"0x{ReadU16(input, cursor):x4}");
++                        cursor += 2;
++                    }
++                    supportedVersions = versions.Count == 0 ? "empty" : string.Join(",", versions);
++                }
++
++                q = dataEnd;
++            }
++
++            int recordVersion = ReadU16(input, 1);
++            description = $"recordVersion=0x{recordVersion:x4} supportedVersions={supportedVersions} sni={sni} alpn={alpn} cipherSuites={cipherSuiteCount} extensions={extensionCount}";
++            return true;
++        }
++
++        public static string DescribeServerFlight(ReadOnlySpan<byte> input)
++        {
++            if (input.Length < 5)
+             {
+-                return false; // ClientHello spans more than this buffer — don't touch it
++                return $"partial length={input.Length}";
+             }
+
+-            // Handshake header: msg_type=0x01 (ClientHello), length(3).
+-            if (input[5] != 0x01)
++            List<string> records = new();
++            int cursor = 0;
++            while (cursor + 5 <= input.Length)
+             {
+-                return false;
++                int type = input[cursor];
++                int length = ReadU16(input, cursor + 3);
++                records.Add($"0x{type:x2}:{length}");
++                if (cursor + 5 + length > input.Length) break;
++                cursor += 5 + length;
+             }
+
+-            int p = 5 + 4;   // record header (5) + handshake header (4)
+-            p += 2;          // client_version
+-            p += 32;         // random
+-            if (p >= input.Length) return false;
+-            int sidLen = input[p]; p += 1 + sidLen;                       // legacy_session_id
+-            if (p + 2 > input.Length) return false;
+-            int csLen = (input[p] << 8) | input[p + 1]; p += 2 + csLen;   // cipher_suites
+-            if (p + 1 > input.Length) return false;
+-            int cmLen = input[p]; p += 1 + cmLen;                         // compression_methods
+-            if (p + 2 > input.Length) return false;
++            string serverHello = "unparsed";
++            int firstLength = ReadU16(input, 3);
++            if (input[0] == 0x16 && firstLength >= 42 && input.Length >= 5 + firstLength && input[5] == 0x02)
++            {
++                int p = 9;
++                int selectedVersion = ReadU16(input, p); p += 2 + 32;
++                int sessionIdLength = input[p++]; p += sessionIdLength;
++                if (p + 3 <= 5 + firstLength)
++                {
++                    int cipherSuite = ReadU16(input, p); p += 2;
++                    int compression = input[p++];
++                    string alpn = "absent";
++                    string negotiatedVersion = $"0x{selectedVersion:x4}";
++                    if (p + 2 <= 5 + firstLength)
++                    {
++                        int extensionsEnd = Math.Min(p + 2 + ReadU16(input, p), 5 + firstLength);
++                        p += 2;
++                        while (p + 4 <= extensionsEnd)
++                        {
++                            int type = ReadU16(input, p);
++                            int length = ReadU16(input, p + 2);
++                            int dataStart = p + 4;
++                            if (dataStart + length > extensionsEnd) break;
++                            if (type == 16 && length >= 3)
++                            {
++                                int protocolLength = input[dataStart + 2];
++                                if (dataStart + 3 + protocolLength <= dataStart + length)
++                                {
++                                    alpn = Encoding.ASCII.GetString(input.Slice(dataStart + 3, protocolLength));
++                                }
++                            }
++                            else if (type == 43 && length == 2)
++                            {
++                                negotiatedVersion = $"0x{ReadU16(input, dataStart):x4}";
++                            }
++                            p = dataStart + length;
++                        }
++                    }
++                    serverHello = $"version={negotiatedVersion} cipher=0x{cipherSuite:x4} compression={compression} alpn={alpn}";
++                }
++            }
++
++            return $"received={input.Length} records={string.Join(",", records)} serverHello=({serverHello})";
++        }
++
++        public static bool TryInject(ReadOnlySpan<byte> input, string hostName, out byte[] output)
++        {
++            output = null;
+
+-            int extTotalLen = (input[p] << 8) | input[p + 1];
+-            int extLenPos = p;
+-            int extStart = p + 2;
+-            int extEnd = extStart + extTotalLen;
+-            if (extEnd > input.Length) return false;
++            if (!TryGetExtensions(input, out _, out int extStart, out int extEnd)) return false;
++            int extLenPos = extStart - 2;
++            int extTotalLen = extEnd - extStart;
++            int recordLen = ReadU16(input, 3);
+
+             // Already has a server_name (0x0000) extension? Leave it alone.
+             int q = extStart;
+@@ -97,5 +203,43 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+
+             return true;
+         }
++
++        private static int ReadU16(ReadOnlySpan<byte> input, int offset)
++        {
++            return (input[offset] << 8) | input[offset + 1];
++        }
++
++        private static bool TryGetExtensions(ReadOnlySpan<byte> input, out int cipherSuiteCount, out int extStart, out int extEnd)
++        {
++            cipherSuiteCount = 0;
++            extStart = 0;
++            extEnd = 0;
++
++            if (input.Length < 43 || input[0] != 0x16 || input[5] != 0x01)
++            {
++                return false;
++            }
++
++            int recordLen = ReadU16(input, 3);
++            if (5 + recordLen > input.Length)
++            {
++                return false;
++            }
++
++            int p = 9 + 2 + 32;
++            if (p >= input.Length) return false;
++            int sidLen = input[p]; p += 1 + sidLen;
++            if (p + 2 > input.Length) return false;
++            int csLen = ReadU16(input, p); p += 2 + csLen;
++            if ((csLen & 1) != 0 || p + 1 > input.Length) return false;
++            cipherSuiteCount = csLen / 2;
++            int cmLen = input[p]; p += 1 + cmLen;
++            if (p + 2 > input.Length) return false;
++
++            int extTotalLen = ReadU16(input, p);
++            extStart = p + 2;
++            extEnd = extStart + extTotalLen;
++            return extEnd <= 5 + recordLen && extEnd <= input.Length;
++        }
+     }
+ }

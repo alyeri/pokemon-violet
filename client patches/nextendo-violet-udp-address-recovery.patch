@@ -1,0 +1,89 @@
+diff --git a/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/ManagedSocket.cs b/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/ManagedSocket.cs
+--- a/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/ManagedSocket.cs
++++ b/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Impl/ManagedSocket.cs
+@@ -525,6 +525,8 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+         public LinuxError SendTo(out int sendSize, ReadOnlySpan<byte> buffer, int size, BsdSocketFlags flags, IPEndPoint remoteEndPoint)
+         {
++            remoteEndPoint = RecoverLostRedirectedDatagramEndpoint(remoteEndPoint);
++
+             try
+             {
+                 sendSize = Socket.SendTo(buffer[..size], ConvertBsdSocketFlags(flags), remoteEndPoint);
+
+@@ -544,6 +546,39 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl
+                 return WinSockHelper.ConvertError((WsaError)exception.ErrorCode);
+             }
+         }
++
++        internal static IPEndPoint RecoverLostRedirectedDatagramEndpoint(IPEndPoint remoteEndPoint)
++        {
++            IPAddress address = remoteEndPoint.Address;
++            bool isAny = address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any)
++                         || (address.IsIPv4MappedToIPv6 && address.MapToIPv4().Equals(IPAddress.Any));
++
++            if (!isAny)
++            {
++                return remoteEndPoint;
++            }
++
++            // getaddrinfo results are known to lose their address while retaining the port in
++            // this client path. Recover only an endpoint whose exact port was recorded by the
++            // resolver. An arbitrary peer port has no entry and is deliberately left unchanged.
++            IPAddress recovered = Ryujinx.HLE.HOS.Services.Sockets.Sfdnsres.Proxy.DnsMitmResolver.RedirectionPour(remoteEndPoint.Port);
++
++            if (recovered == null)
++            {
++                Logger.Warning?.Print(LogClass.ServiceBsd,
++                    $"[Nextendo] UDP target was {address}:{remoteEndPoint.Port} (lost address); no exact-port DNS result is available");
++                return remoteEndPoint;
++            }
++
++            if (address.AddressFamily == AddressFamily.InterNetworkV6 && recovered.AddressFamily == AddressFamily.InterNetwork)
++            {
++                recovered = recovered.MapToIPv6();
++            }
++
++            Logger.Info?.Print(LogClass.ServiceBsd,
++                $"[Nextendo] UDP target was {address}:{remoteEndPoint.Port} (lost address) -> substituting {recovered}");
++            return new IPEndPoint(recovered, remoteEndPoint.Port);
++        }
+
+         // [Nextendo] Fill optionValue with the value a prior setsockopt feigned success on (or zeros), so
+         // getsockopt round-trips what the client set instead of failing.
+diff --git a/src/Ryujinx.Tests/HLE/LanPlayTests.cs b/src/Ryujinx.Tests/HLE/LanPlayTests.cs
+--- a/src/Ryujinx.Tests/HLE/LanPlayTests.cs
++++ b/src/Ryujinx.Tests/HLE/LanPlayTests.cs
+@@ -13,6 +13,7 @@ using Ryujinx.HLE.HOS.Services.Sockets.Bsd;
+ using Ryujinx.HLE.HOS.Services.Sockets.Bsd.Impl;
+ using Ryujinx.HLE.HOS.Services.Sockets.Bsd.Proxy;
+ using Ryujinx.HLE.HOS.Services.Sockets.Bsd.Types;
++using Ryujinx.HLE.HOS.Services.Sockets.Sfdnsres.Proxy;
+ using System;
+ using System.Buffers.Binary;
+ using System.Collections.Generic;
+@@ -306,6 +307,25 @@ namespace Ryujinx.Tests.HLE
+             receiver.Close();
+         }
++
++        [Test]
++        public void LostUdpAddressUsesOnlyTheDnsResultForTheExactPort()
++        {
++            const int ResolvedPort = 3478;
++            const int UnrelatedPort = 3479;
++
++            DnsMitmResolver.NoterRedirection(ResolvedPort, IPAddress.Loopback);
++
++            IPEndPoint recovered = ManagedSocket.RecoverLostRedirectedDatagramEndpoint(
++                new IPEndPoint(IPAddress.Any, ResolvedPort));
++            IPEndPoint untouched = ManagedSocket.RecoverLostRedirectedDatagramEndpoint(
++                new IPEndPoint(IPAddress.Any, UnrelatedPort));
++
++            Assert.That(recovered.Address, Is.EqualTo(IPAddress.Loopback));
++            Assert.That(recovered.Port, Is.EqualTo(ResolvedPort));
++            Assert.That(untouched.Address, Is.EqualTo(IPAddress.Any),
++                "an unknown peer port must never inherit another service's address");
++        }
+
+         [Test]
+         public void LdnSessionIsDiscoveredAndJoinedOverTheRelay()
+         {

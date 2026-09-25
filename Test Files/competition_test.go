@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -8,6 +12,140 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protowire"
 )
+
+func testStringField(t *testing.T, data []byte, target protowire.Number) string {
+	t.Helper()
+	for len(data) > 0 {
+		number, typ, tagSize := protowire.ConsumeTag(data)
+		if tagSize < 0 {
+			t.Fatal(protowire.ParseError(tagSize))
+		}
+		data = data[tagSize:]
+		if number == target && typ == protowire.BytesType {
+			value, consumed := protowire.ConsumeString(data)
+			if consumed < 0 {
+				t.Fatal(protowire.ParseError(consumed))
+			}
+			return value
+		}
+		consumed := protowire.ConsumeFieldValue(number, typ, data)
+		if consumed < 0 {
+			t.Fatal(protowire.ParseError(consumed))
+		}
+		data = data[consumed:]
+	}
+	return ""
+}
+
+func testVarintField(t *testing.T, data []byte, target protowire.Number) uint64 {
+	t.Helper()
+	var found uint64
+	for len(data) > 0 {
+		number, typ, tagSize := protowire.ConsumeTag(data)
+		if tagSize < 0 {
+			t.Fatal(protowire.ParseError(tagSize))
+		}
+		data = data[tagSize:]
+		if number == target && typ == protowire.VarintType {
+			value, consumed := protowire.ConsumeVarint(data)
+			if consumed < 0 {
+				t.Fatal(protowire.ParseError(consumed))
+			}
+			found = value
+		}
+		consumed := protowire.ConsumeFieldValue(number, typ, data)
+		if consumed < 0 {
+			t.Fatal(protowire.ParseError(consumed))
+		}
+		data = data[consumed:]
+	}
+	return found
+}
+
+func TestHostCompetitionPreservesFriendlyPayload(t *testing.T) {
+	server := newCompetitionServer()
+	competition := appendStringField(nil, 1, "tenants/current/competitions/")
+	applicationData := appendStringField(nil, 1, "RulePresetNo=10")
+	competition = appendBytesField(competition, 24, applicationData)
+	competition = appendVarintField(competition, 33, 2)
+	participant := appendVarintField(nil, 2, 51)
+	participant = appendStringField(participant, 3, "device-uuid")
+	participant = appendStringField(participant, 4, "+0000")
+	request := appendStringField(nil, 1, "tenants/current")
+	request = appendBytesField(request, 2, competition)
+	request = appendBytesField(request, 3, participant)
+
+	response, err := server.HostCompetition(violetAuthenticatedContext("u-host"), &rawMsg{b: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.b) == 0 {
+		t.Fatal("HostCompetition returned an empty response")
+	}
+
+	server.mu.Lock()
+	profile := server.users["u-host"]
+	hosted, ok := server.hosted[profile.currentFriendly]
+	server.mu.Unlock()
+	name := profile.currentFriendly
+	if !ok {
+		t.Fatalf("hosted competition %q was not stored", name)
+	}
+	if !strings.HasPrefix(name, nplnTenant+"/competitions/") || strings.HasSuffix(name, "/") {
+		t.Fatalf("server did not allocate a competition resource ID: %q", name)
+	}
+	storedName, competitionType, err := competitionIdentity(hosted.competition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedName != name || competitionType != 2 {
+		t.Fatalf("unexpected hosted identity: name=%q type=%d", storedName, competitionType)
+	}
+	if !bytes.Contains(hosted.competition, applicationData) {
+		t.Fatal("client-supplied application_data was not preserved")
+	}
+	aliasName := testStringField(t, hosted.competition, 2)
+	aliasCode := lastResourceSegment(aliasName)
+	if !strings.HasPrefix(aliasName, nplnTenant+"/competitionAliases/") || len(aliasCode) != 6 {
+		t.Fatalf("invalid friendly competition alias %q", aliasName)
+	}
+	aliasResponse, err := server.GetCompetitionAlias(violetAuthenticatedContext("u-guest"), &rawMsg{b: appendStringField(nil, 1, strings.Replace(aliasName, nplnTenant, "tenants/current", 1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAlias, gotCompetition := testStringField(t, aliasResponse.b, 1), testStringField(t, aliasResponse.b, 2); gotAlias != aliasName || gotCompetition != name {
+		t.Fatalf("unexpected competition alias response: alias=%q competition=%q", gotAlias, gotCompetition)
+	}
+	if !bytes.Contains(hosted.participant, []byte(name+"/participants/u-host")) ||
+		!bytes.Contains(hosted.participant, []byte("device-uuid")) {
+		t.Fatal("participant identity or client data was not preserved")
+	}
+	if profile.currentFriendly != name {
+		t.Fatalf("profile did not reference hosted competition: %q", profile.currentFriendly)
+	}
+
+	got, err := server.GetCompetition(violetAuthenticatedContext("u-guest"), &rawMsg{b: appendStringField(nil, 1, name)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.b, hosted.competition) {
+		t.Fatal("GetCompetition did not return the stored competition")
+	}
+
+	requestedParticipant := strings.Replace(name, nplnTenant, "tenants/current", 1) + "/participants/u-game"
+	gotParticipant, err := server.GetCompetitionParticipant(violetAuthenticatedContext("u-host"), &rawMsg{b: appendStringField(nil, 1, requestedParticipant)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	participantResource, err := parseProtoStringMessage(gotParticipant.b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantParticipant := name + "/participants/u-game"
+	if participantResource != wantParticipant {
+		t.Fatalf("unexpected hosted participant resource: got %q want %q", participantResource, wantParticipant)
+	}
+}
 
 func TestCompetitionUserWireContract(t *testing.T) {
 	const name = "tenants/current/competitionUsers/current"
@@ -79,6 +217,49 @@ func TestCompetitionUserWireContract(t *testing.T) {
 	}
 }
 
+func TestUpdateCompetitionUserCapturedOnlineCompetitionProfile(t *testing.T) {
+	user := appendStringField(nil, 1, "tenants/current/competitionUsers/current")
+	user = appendVarintField(user, 3, 399)
+	user = appendStringField(user, 4, "en")
+	user = appendVarintField(user, 14, 1)
+	mask := []byte(nil)
+	for _, path := range []string{"category", "birthmonth", "area", "language_code"} {
+		mask = appendStringField(mask, 1, path)
+	}
+	request := appendBytesField(nil, 1, user)
+	request = appendBytesField(request, 2, mask)
+
+	server := newCompetitionServer()
+	response, err := server.UpdateCompetitionUser(violetAuthenticatedContext("u-junior"), &rawMsg{b: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := server.users["u-junior"]
+	if profile.area != 399 || profile.language != "en" || profile.category != 1 || !profile.initialized {
+		t.Fatalf("unexpected stored profile: %#v", profile)
+	}
+
+	parsed, err := parseCompetitionUserUpdate(appendBytesField(nil, 1, response.b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.name != "tenants/current/competitionUsers/current" || parsed.area != 399 || parsed.language != "en" || parsed.category != 1 {
+		t.Fatalf("unexpected UpdateCompetitionUser response: %#v", parsed)
+	}
+
+	getResponse, err := server.GetCompetitionUser(violetAuthenticatedContext("u-junior"), &rawMsg{b: appendStringField(nil, 1, "tenants/current/competitionUsers/current")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err = parseCompetitionUserUpdate(appendBytesField(nil, 1, getResponse.b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.area != 399 || parsed.category != 1 {
+		t.Fatalf("GetCompetitionUser lost saved profile: %#v", parsed)
+	}
+}
+
 func TestRankedCompetitionSearchWireContract(t *testing.T) {
 	request := appendStringField(nil, 1, "tenants/current")
 	request = appendVarintField(request, 2, 2)
@@ -141,6 +322,183 @@ func TestRankedCompetitionSearchRejectsOtherTypes(t *testing.T) {
 	_, err := newCompetitionServer().SearchCompetitions(violetAuthenticatedContext("u-owner"), &rawMsg{b: request})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("ranked search with type 5 error = %v, want InvalidArgument", err)
+	}
+}
+
+func TestOnlineOfficialCompetitionCapturedSearch(t *testing.T) {
+	image := filepath.Join(t.TempDir(), "main.bin")
+	f, err := os.Create(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := make([]byte, violetRegulationSize)
+	copy(record, []byte{1, 3, 6, 3, 3})
+	record[len(record)-1] = 0xa5
+	if _, err := f.WriteAt(record, violetRegulationOffset+9*violetRegulationSize); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VIOLET_RANKED_MAIN_IMAGE", image)
+
+	request := appendStringField(nil, 1, "tenants/current")
+	request = appendVarintField(request, 2, 10)
+	request = appendVarintField(request, 4, 1)
+	request = appendBytesField(request, 6, []byte{1})
+
+	response, err := newCompetitionServer().SearchCompetitions(violetAuthenticatedContext("u-owner"), &rawMsg{b: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	competition, consumed := protowire.ConsumeBytes(response.b[1:])
+	if consumed < 0 {
+		t.Fatal(protowire.ParseError(consumed))
+	}
+	var name string
+	var alias string
+	var matchmakingConfig string
+	var competitionType uint64
+	var applicationData []byte
+	for len(competition) > 0 {
+		field, typ, tagSize := protowire.ConsumeTag(competition)
+		if tagSize < 0 {
+			t.Fatal(protowire.ParseError(tagSize))
+		}
+		competition = competition[tagSize:]
+		var fieldSize int
+		if field == 1 && typ == protowire.BytesType {
+			name, fieldSize = protowire.ConsumeString(competition)
+		} else if field == 2 && typ == protowire.BytesType {
+			alias, fieldSize = protowire.ConsumeString(competition)
+		} else if field == 17 && typ == protowire.BytesType {
+			matchmakingConfig, fieldSize = protowire.ConsumeString(competition)
+		} else if field == 24 && typ == protowire.BytesType {
+			applicationData, fieldSize = protowire.ConsumeBytes(competition)
+		} else if field == 33 && typ == protowire.VarintType {
+			competitionType, fieldSize = protowire.ConsumeVarint(competition)
+		} else {
+			fieldSize = protowire.ConsumeFieldValue(field, typ, competition)
+		}
+		if fieldSize < 0 {
+			t.Fatal(protowire.ParseError(fieldSize))
+		}
+		competition = competition[fieldSize:]
+	}
+	if name != officialCompetitionName() || competitionType != 1 || matchmakingConfig != nplnTenant+"/matchmakingConfigs/Competition" {
+		t.Fatalf("unexpected official competition name=%q type=%d matchmaking_config=%q", name, competitionType, matchmakingConfig)
+	}
+	if alias != competitionAliasName("OFC001") {
+		t.Fatalf("unexpected official competition alias %q", alias)
+	}
+	for _, key := range []string{"RulePresetNo", "ControlTimeOverride", "HostPlayerName", "TotalTimeOverride", "Regulation"} {
+		if !bytes.Contains(applicationData, []byte(key)) {
+			t.Fatalf("official application_data is missing %q", key)
+		}
+	}
+}
+
+func TestGetOnlineOfficialCompetitionAcceptsCurrentTenantAlias(t *testing.T) {
+	image := filepath.Join(t.TempDir(), "main.bin")
+	f, err := os.Create(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := make([]byte, violetRegulationSize)
+	copy(record, []byte{1, 3, 6, 3, 3})
+	if _, err := f.WriteAt(record, violetRegulationOffset+9*violetRegulationSize); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VIOLET_RANKED_MAIN_IMAGE", image)
+
+	request := appendStringField(nil, 1, "tenants/current/competitions/local-online-official-1")
+	request = appendVarintField(request, 2, 1) // FULL.
+	response, err := newCompetitionServer().GetCompetition(violetAuthenticatedContext("u-owner"), &rawMsg{b: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := testStringField(t, response.b, 1); got != officialCompetitionName() {
+		t.Fatalf("official competition name = %q, want %q", got, officialCompetitionName())
+	}
+}
+
+func TestCreateOfficialCompetitionParticipant(t *testing.T) {
+	server := newCompetitionServer()
+	uid := "u-owner"
+	server.users[uid] = competitionUserProfile{area: 399, language: "en", category: 1, initialized: true}
+	binary := bytes.Repeat([]byte{0x5a}, 2352)
+	participant := appendVarintField(nil, 2, 51)
+	participant = appendStringField(participant, 3, "78563412-dea1-71a5-016d-7342f0debc9a")
+	participant = appendStringField(participant, 4, "+0000")
+	participant = appendBytesField(participant, 5, binary)
+	request := appendStringField(nil, 1, "tenants/current/competitions/local-online-official-1")
+	request = appendBytesField(request, 2, participant)
+
+	response, err := server.CreateCompetitionParticipant(violetAuthenticatedContext(uid), &rawMsg{b: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantName := officialCompetitionName() + "/participants/" + uid
+	if got := testStringField(t, response.b, 1); got != wantName {
+		t.Fatalf("participant name = %q, want %q", got, wantName)
+	}
+	if !bytes.Contains(response.b, binary) {
+		t.Fatal("participant response did not preserve participant_binary")
+	}
+	if got := testVarintField(t, response.b, 13); got != rankedInitialRating {
+		t.Fatalf("participant rating = %d, want %d", got, rankedInitialRating)
+	}
+
+	userResponse, err := server.GetCompetitionUser(violetAuthenticatedContext(uid), &rawMsg{b: appendStringField(nil, 1, "tenants/current/competitionUsers/current")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := testStringField(t, userResponse.b, 5); got != officialCompetitionName() {
+		t.Fatalf("current official competition = %q", got)
+	}
+
+	participantResponse, err := server.GetCompetitionParticipant(violetAuthenticatedContext(uid), &rawMsg{b: appendStringField(nil, 1, wantName)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := testStringField(t, participantResponse.b, 1); got != wantName {
+		t.Fatalf("stored participant name = %q", got)
+	}
+
+	requestedAlias := officialCompetitionName() + "/participants/u-title-save"
+	aliasResponse, err := server.GetCompetitionParticipant(violetAuthenticatedContext(uid), &rawMsg{b: appendStringField(nil, 1, requestedAlias)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := testStringField(t, aliasResponse.b, 1); got != requestedAlias {
+		t.Fatalf("aliased participant name = %q, want %q", got, requestedAlias)
+	}
+	if !bytes.Contains(aliasResponse.b, binary) {
+		t.Fatal("aliased participant response did not preserve participant_binary")
+	}
+
+	activateRequest := appendStringField(nil, 1, "tenants/current/competitions/local-online-official-1/participants/current")
+	activateRequest = appendBytesField(activateRequest, 2, nil)
+	activated, err := server.ActivateCompetitionParticipant(violetAuthenticatedContext(uid), &rawMsg{b: activateRequest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := testVarintField(t, activated.b, 6); got != 2 {
+		t.Fatalf("activated participant state = %d, want ACTIVE", got)
+	}
+	if !bytes.Contains(activated.b, binary) {
+		t.Fatal("activation did not preserve participant_binary")
+	}
+	if got := testVarintField(t, activated.b, 13); got != rankedInitialRating {
+		t.Fatalf("activated participant rating = %d, want %d", got, rankedInitialRating)
+	}
+	if competition, err := rankedNotificationCompetition("tenants/current/competitions/local-online-official-1/participants/current/notification"); err != nil || competition != officialCompetitionName() {
+		t.Fatalf("official notification competition = %q, error=%v", competition, err)
 	}
 }
 

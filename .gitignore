@@ -22,3 +22,7 @@ go.work.sum
 /trade-validation-rsa.pem
 /npln_jwt_violet_es256.key
 /coverage.out
+/private/
+/work/
+*.wc9
+distribution_internet

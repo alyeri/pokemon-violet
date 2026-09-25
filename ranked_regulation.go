@@ -6,6 +6,27 @@ import (
 	"time"
 )
 
+const (
+	violetRegulationOffset = int64(0x3c318d4)
+	violetRegulationSize   = int64(0x29c0)
+)
+
+func loadVioletRegulationRecord(preset int64) ([]byte, error) {
+	if preset < 1 || preset > 16 {
+		return nil, fmt.Errorf("unsupported Violet regulation preset %d", preset)
+	}
+	f, err := os.Open(os.Getenv("VIOLET_RANKED_MAIN_IMAGE"))
+	if err != nil {
+		return nil, fmt.Errorf("open local Violet 3.0.1 main image: %w", err)
+	}
+	defer f.Close()
+	record := make([]byte, violetRegulationSize)
+	if _, err := f.ReadAt(record, violetRegulationOffset+(preset-1)*violetRegulationSize); err != nil {
+		return nil, fmt.Errorf("read Violet regulation preset %d: %w", preset, err)
+	}
+	return record, nil
+}
+
 // Violet 3.0.1 consumes application_data.Regulation as Value.bytes_value,
 // not a preset number or base64 string. Read the user's local main image;
 // do not redistribute the game's embedded regulation records.
@@ -16,14 +37,9 @@ func marshalRankedCompetitionRegulated(name string, kind uint64, now time.Time) 
 	} else if kind != 3 {
 		return nil, fmt.Errorf("unsupported ranked type %d", kind)
 	}
-	f, err := os.Open(os.Getenv("VIOLET_RANKED_MAIN_IMAGE"))
+	record, err := loadVioletRegulationRecord(preset)
 	if err != nil {
-		return nil, fmt.Errorf("open local Violet 3.0.1 main image: %w", err)
-	}
-	defer f.Close()
-	record := make([]byte, 0x29c0)
-	if _, err := f.ReadAt(record, 0x3c318d4+(preset-1)*0x29c0); err != nil {
-		return nil, fmt.Errorf("read ranked preset: %w", err)
+		return nil, err
 	}
 	if record[0] != ruleID || record[1] != minimum || record[2] != 6 || record[3] != minimum || record[4] != minimum {
 		return nil, fmt.Errorf("unexpected Violet ranked preset header")

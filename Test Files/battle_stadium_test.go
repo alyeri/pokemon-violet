@@ -57,3 +57,28 @@ func TestRankBattleUsesNotificationPasswordPool(t *testing.T) {
 		t.Fatal("different Ranked notification keys shared a pool")
 	}
 }
+
+func TestOfficialCompetitionUsesNotificationPasswordPool(t *testing.T) {
+	ticket := func(password string) *mmpb.MatchmakingTicket {
+		return &mmpb.MatchmakingTicket{
+			MatchmakingConfig: "tenants/current/matchmakingConfigs/Competition",
+			UserDefinitions: []*mmpb.UserDefinition{{
+				Attributes: &commonpb.MapValue{Fields: map[string]*commonpb.Value{
+					"password": gamesyncStringValue(password),
+				}},
+			}},
+		}
+	}
+	if err := validateVioletMatchmakingConfig(ticket("competition-key").GetMatchmakingConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if !violetPairConfig("Competition") || publicMatchCapacity("Competition") != 2 {
+		t.Fatal("Competition must be a two-player configuration")
+	}
+	if publicMatchPoolKey(ticket("competition-key")) != publicMatchPoolKey(ticket("competition-key")) {
+		t.Fatal("equal competition notification keys did not share a pool")
+	}
+	if publicMatchPoolKey(ticket("competition-key")) == publicMatchPoolKey(ticket("other-key")) {
+		t.Fatal("different competition notification keys shared a pool")
+	}
+}

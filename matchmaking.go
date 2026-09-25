@@ -104,7 +104,7 @@ func matchmakingSessionProperties(config string) *commonpb.MapValue {
 const violetUnionCircleConfig = "TeamCircle"
 
 func validateVioletMatchmakingConfig(config string) error {
-	if lastResourceSegment(config) != violetUnionCircleConfig && !violetPairConfig(config) {
+	if lastResourceSegment(config) != violetUnionCircleConfig && lastResourceSegment(config) != "RaidPublic" && !violetPairConfig(config) {
 		return status.Errorf(codes.Unimplemented, "matchmaking configuration %q is not part of the observed Violet contract", lastResourceSegment(config))
 	}
 	return nil
@@ -186,7 +186,7 @@ func publicMatchPoolKey(ticket *mmpb.MatchmakingTicket) string {
 
 func violetPairConfig(config string) bool {
 	name := lastResourceSegment(config)
-	return name == "BoxTrade" || name == "NbrSingle" || name == "CasualBattle" || name == "RankBattle"
+	return name == "BoxTrade" || name == "NbrSingle" || name == "CasualBattle" || name == "RankBattle" || name == "Competition"
 }
 
 func publicMatchCapacity(config string) int32 {

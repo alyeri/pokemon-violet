@@ -9,7 +9,7 @@ import (
 )
 
 func TestPortalPairing(t *testing.T) {
-	for _, config := range []string{"BoxTrade", "NbrSingle", "RankBattle"} {
+	for _, config := range []string{"BoxTrade", "NbrSingle", "RankBattle", "Competition"} {
 		t.Run(config, func(t *testing.T) {
 			r := newSessionRegistry()
 			m := newMatchmaker(r)

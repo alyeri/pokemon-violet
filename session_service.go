@@ -74,7 +74,7 @@ func validateGameSessionSearchConfig(req *mmpb.QueryGameSessionsRequest) error {
 	if config == "" {
 		return nil
 	}
-	if config != violetUnionCircleConfig {
+	if config != violetUnionCircleConfig && config != "RaidPublicSearch" {
 		return status.Errorf(codes.Unimplemented, "game-session search configuration %q is not part of the observed Violet contract", config)
 	}
 	return nil
@@ -154,6 +154,9 @@ func (g *gameSessionServer) QueryGameSessions(ctx context.Context, req *mmpb.Que
 			continue
 		}
 		gs := g.sessions[name]
+		if lastResourceSegment(req.GameSessionSearchConfig) == "RaidPublicSearch" && g.registry.configs[gs.Name] != "RaidPublic" {
+			continue
+		}
 		if !roomVisible(gs, uid) || !gs.CanParticipate || gs.MaxParticipantCount-gs.CurrentParticipantCount < req.MinVacancyCount || gs.CurrentParticipantCount < req.MinParticipantCount {
 			continue
 		}

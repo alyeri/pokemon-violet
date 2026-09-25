@@ -58,9 +58,9 @@ building. The repository does not include a client binary.
 
 ## Mystery Gift cards
 
-`scripts/build-violet-op-gifts.ps1` builds five item WC9 cards from a separately
+`build-violet-op-gifts.ps1` builds five item WC9 cards from a separately
 obtained, valid Scarlet/Violet item-card template. It recalculates each WC9
-checksum. `scripts/install-violet-mystery-gift.ps1` validates card structure,
+checksum. `install-violet-mystery-gift.ps1` validates card structure,
 checksum and duplicate IDs before installing a merged catalog in a selected
 Ryujinx profile. The repository includes neither a template nor gift binaries.
 

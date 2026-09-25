@@ -25,12 +25,12 @@ verification and the in-game listing and redemption test.
 To build the cards, supply your own valid item WC9 template:
 
 ```powershell
-pwsh -NoProfile -File scripts/build-violet-op-gifts.ps1 `
+pwsh -NoProfile -File build-violet-op-gifts.ps1 `
   -TemplatePath private/cards/item-template.wc9 `
   -OutputDirectory private/cards/op-gifts
 ```
 
 To install, pass an array of WC9 paths and the root of the chosen Ryujinx
-profile to `scripts/install-violet-mystery-gift.ps1`. Back up the profile's
+profile to `install-violet-mystery-gift.ps1`. Back up the profile's
 existing `distribution_internet` file before changing it. Neither the cards
 nor Pokémon game content are included in this repository.
